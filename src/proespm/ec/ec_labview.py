@@ -1,5 +1,7 @@
 import io
 import os
+import warnings
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Self, final, override
@@ -12,6 +14,88 @@ from proespm.config import Config
 from proespm.ec.ec import EcPlot
 from proespm.fileinfo import Fileinfo
 from proespm.measurement import Measurement
+
+
+def _to_float(value: str) -> float:
+    """Convert a single cell to float, empty or invalid cells become NaN."""
+
+    value = value.strip()
+    if not value:
+        return np.nan
+
+    try:
+        return float(value)
+    except ValueError:
+        return np.nan
+
+
+def _read_labview_data(filepath: Path) -> tuple[NDArray[np.float64], list[str]]:
+    """Read the numeric data of a LabView file as numpy array.
+
+    Replacement for a plain `np.loadtxt` call, which aborts on any row that
+    deviates from the column count of the first row. Two defects occur in
+    practice and are handled here:
+
+    - A cell is empty (acquisition glitch). Splitting on whitespace would
+      silently drop the column, so the row is split on the actual delimiter
+      and the missing value becomes NaN.
+    - A row has a deviating number of columns (usually a truncated last line
+      of an aborted measurement). The row is dropped.
+
+    Args:
+        filepath: Full path of the LabView file.
+
+    Returns:
+        Tuple of the numeric data (without the header line) and a list of
+        messages describing every defect that was repaired.
+    """
+
+    with open(filepath, "rb") as f:
+        raw = f.read()
+
+    text = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("latin-1")
+
+    lines = [line for line in text.split("\n")[1:] if line.strip()]
+    if not lines:
+        raise ValueError(f"{filepath.name}: file contains no data rows")
+
+    delimiter = "\t" if "\t" in lines[0] else None
+    rows = [
+        line.split(delimiter) if delimiter is not None else line.split()
+        for line in lines
+    ]
+
+    counts = Counter(len(row) for row in rows)
+    n_cols = counts.most_common(1)[0][0]
+
+    messages: list[str] = []
+    if len(counts) > 1:
+        dropped = [
+            (i, len(row)) for i, row in enumerate(rows) if len(row) != n_cols
+        ]
+        rows = [row for row in rows if len(row) == n_cols]
+        preview = ", ".join(
+            f"line {i + 2} ({n} instead of {n_cols} columns)"
+            for i, n in dropped[:5]
+        )
+        if len(dropped) > 5:
+            preview += f", ... ({len(dropped)} rows in total)"
+        messages.append(f"{filepath.name}: dropped malformed rows: {preview}")
+
+    if not rows:
+        raise ValueError(f"{filepath.name}: no consistent data rows found")
+
+    data = np.array(
+        [[_to_float(cell) for cell in row] for row in rows], dtype=np.float64
+    )
+
+    n_nan = int(np.count_nonzero(np.isnan(data)))
+    if n_nan > 0:
+        messages.append(
+            f"{filepath.name}: {n_nan} empty or invalid values replaced by NaN"
+        )
+
+    return data, messages
 
 
 @final
@@ -32,6 +116,7 @@ class CvLabview(Measurement):
         self.fileinfo = Fileinfo(filepath)
 
         self.type: str | None = None
+        self.parse_warnings: list[str] = []
         self.data = self.read_cv_data(filepath)
 
         self.u_start: float | None = None
@@ -57,12 +142,12 @@ class CvLabview(Measurement):
     def read_cv_data(self, filepath: Path) -> NDArray[np.float64]:
         """Read the numeric data as numpy array"""
 
-        with open(filepath, "rb") as f:
-            raw = f.read()
+        data, messages = _read_labview_data(filepath)
+        self.parse_warnings.extend(messages)
+        for message in messages:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
 
-        raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-
-        return np.loadtxt(io.BytesIO(raw), skiprows=1)
+        return data
 
     def read_params(self) -> None:
         """Calculate relevent parameters"""
@@ -76,20 +161,20 @@ class CvLabview(Measurement):
             self.u_bias_start = self.data[0, 4]
 
         if np.sign(self.data[10, 1] - self.data[0, 1]) < 0:
-            self.u_1 = float(np.min(self.data[:, 1]))
-            self.u_2 = float(np.max(self.data[:, 1]))
+            self.u_1 = float(np.nanmin(self.data[:, 1]))
+            self.u_2 = float(np.nanmax(self.data[:, 1]))
 
             if is_bias_valid:
-                self.u_bias_1 = float(np.min(self.data[:, 4]))
-                self.u_bias_2 = float(np.max(self.data[:, 4]))
+                self.u_bias_1 = float(np.nanmin(self.data[:, 4]))
+                self.u_bias_2 = float(np.nanmax(self.data[:, 4]))
 
         else:
-            self.u_1 = float(np.max(self.data[:, 1]))
-            self.u_2 = float(np.min(self.data[:, 1]))
+            self.u_1 = float(np.nanmax(self.data[:, 1]))
+            self.u_2 = float(np.nanmin(self.data[:, 1]))
 
             if is_bias_valid:
-                self.u_bias_1 = float(np.max(self.data[:, 4]))
-                self.u_bias_2 = float(np.min(self.data[:, 4]))
+                self.u_bias_1 = float(np.nanmax(self.data[:, 4]))
+                self.u_bias_2 = float(np.nanmin(self.data[:, 4]))
 
         self.timestep = (
             1000
@@ -112,6 +197,18 @@ class CvLabview(Measurement):
 
         x = self.data[:, 1]  # voltage
         y = self.data[:, 2]  # current
+
+        # Rows with repaired (NaN) values would poison the travel distance
+        # below, so they are excluded from the cycle detection.
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+
+        if len(x) < 2:
+            raise ValueError(
+                f"{self.fileinfo.filename}: too few valid data points"
+                " for cycle detection"
+            )
 
         cycle_start_indices = [0]
 
